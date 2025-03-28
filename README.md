@@ -31,6 +31,6 @@ pip install -r requirements.txt
 
 ### Execution
 Execution of the script in `powershell` as follows:
-
+```
 streamlit run main.py
-
+```
