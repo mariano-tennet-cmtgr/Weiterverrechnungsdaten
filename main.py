@@ -7,7 +7,8 @@ import streamlit as st
 import logging
 import warnings
 from collections import Counter  #falls der Concat nicht möglich ist
-import dask.dataframe as dd
+from dask import dataframe as dd
+import numpy as np
 
 # Set maximum number of cores to 12
 os.environ['NUMEXPR_MAX_THREADS'] = '12'
@@ -176,6 +177,7 @@ def join_weiterverrechnungen(ordner: str, n_jobs: int = -1) -> dd:
     results = Parallel(n_jobs=n_jobs)(
         delayed(process_single_file)(file, UNB_dict) for file in WV_files
     )
+
     logging.info("WVD files were processed")
 
     try:
@@ -185,17 +187,21 @@ def join_weiterverrechnungen(ordner: str, n_jobs: int = -1) -> dd:
         logging.info("WVD files were correctly concatenated")
 
         # Convert TM von to datetime
-        ddf['TM von'] = dd.to_datetime(ddf['TM von'], format="%d.%m.%Y", errors='coerce')
+        TM_von_dd = dd.to_datetime(ddf['TM von'], format="%d.%m.%Y", errors='coerce')
 
         # Calculate min and max dates
-        date_df = ddf["TM von"].compute()
-        min_date = date_df.min().strftime("%d%m%Y")
-        max_date = date_df.max().strftime('%d%m%Y')
+        TM_von_df = TM_von_dd.compute()
+        min_date = TM_von_df.min().strftime("%d%m%Y")
+        max_date = TM_von_df.max().strftime("%d%m%Y")
 
         # Save to Excel
         file_name = f"WVD_consolidated_{min_date}_{max_date}_full.csv"
 
         try:
+            logging.info(f"Type of ddf: {type(ddf)}")
+            logging.info(f"Columns: {getattr(ddf, 'columns', 'No columns')}")
+            logging.info(f"Is Dask DataFrame? {isinstance(ddf, dd.DataFrame)}")
+
             dd.to_csv(df=ddf,
                       filename=file_name,
                       single_file=True,
@@ -204,9 +210,11 @@ def join_weiterverrechnungen(ordner: str, n_jobs: int = -1) -> dd:
                       sep=";",
                       decimal=",")
 
-            logging.info(f"{file_name} was created in the directory")
+            logging.info(f"Consolidated file has been created in {os.getcwd()}")
+            st.write(f"{datetime.now()} ----- Consolidated file has been created. Ablagepfad: \n {os.getcwd()}")
 
             return ddf
+
 
         except UnicodeEncodeError as e:
             logging.error(f"{file_name} could not be created due to UnicodeEncodeError:{e}. Please check!")
@@ -306,24 +314,24 @@ def apply_aggregation(group_df: pd.DataFrame, variable: str, group_keys: tuple, 
     """
     logging.info("apply_aggregation() was started")
 
-    # Get the keys, which will then be used in the column name
-    ras_unb, ao, ao_code, ao_art, tm_richtung = group_keys
+    # Convert tuple elements to a string separated by "|"
+    column_name = "|".join(map(str, group_keys))
 
     # Apply the create_aggregated_timeseries with group_df
     result = create_aggregated_timeseries(group_df, variable, date_df)
 
-    # If the resulting df is not empty, then the column name is written
+    # Rename the column dynamically
     if len(result.index) > 0:
-        result = result.rename(columns={variable: f'{ras_unb}|{ao}|{ao_code}|{ao_art}|{tm_richtung}'})
+        result = result.rename(columns={variable: column_name})
 
     # Otherwise the following will be printed
     else:
-        logging.info(f"No data found for combination: {ras_unb}, {ao}, {ao_code}, {ao_art}, {tm_richtung}")
+        logging.info(f"No data found for combination: {column_name}")
 
     return result
 
 
-def aggregate_all_combinations(kw_leistung_df: dd, variable: str, n_jobs: int = -1) -> pd.DataFrame:
+def aggregate_all_combinations(kw_leistung_df: dd, variable: str, groupby_list: list, n_jobs: int = -1) -> pd.DataFrame:
     """
     Apply the aggregation function to every unique combination of 'Zuständiger RAS-ÜNB', 'Aktivierungsobjekt', 'AO-Code'
     and 'AO-Art'.
@@ -365,7 +373,7 @@ def aggregate_all_combinations(kw_leistung_df: dd, variable: str, n_jobs: int = 
     date_df['quarter_hour'] = date_df.groupby('date').cumcount() + 1
 
     # Group by the relevant columns
-    grouped = kw_leistung_df.groupby(['Zuständiger RAS-ÜNB', 'Aktivierungsobjekt', 'AO-Code', 'AO-Art', 'TM-Richtung'], observed=False)
+    grouped = kw_leistung_df.groupby(groupby_list, observed=False)
 
     # Replace variable name if Arbeit [MWh] is chosen
     # Apply parallel processing using joblib
@@ -377,42 +385,119 @@ def aggregate_all_combinations(kw_leistung_df: dd, variable: str, n_jobs: int = 
             for group_keys, group_df in grouped
         )
 
-    else:
-        results = Parallel(n_jobs=n_jobs)(
-                delayed(apply_aggregation)(group_df, variable, group_keys, date_df)
+        combined_results = [dfs for dfs in results if len(dfs.index) > 0]
+
+        if combined_results:
+            final_ddf = dd.concat(combined_results, axis=1, join="outer", interleave_partitions=True)
+        else:
+            final_ddf = None
+
+    elif variable in ["Gesamtkosten [€/Viertelstunde]", "Preis [€/MWh]"]:
+        logging.info(f"Processing {variable} by summing specific variables.")
+
+        # Compute separate aggregations
+        results_1 = Parallel(n_jobs=n_jobs)(
+            delayed(apply_aggregation)(group_df, "Variable Erzeugungsauslagen [€/Viertelstunde]", group_keys, date_df)
+            for group_keys, group_df in grouped
+        )
+
+        results_2 = Parallel(n_jobs=n_jobs)(
+            delayed(apply_aggregation)(group_df, "Anteiliger Werteverbrauch [€/Viertelstunde]", group_keys, date_df)
+            for group_keys, group_df in grouped
+        )
+
+        results_3 = Parallel(n_jobs=n_jobs)(
+            delayed(apply_aggregation)(group_df, "Entgangene Erlöse Intraday [€/Viertelstunde]", group_keys, date_df)
+            for group_keys, group_df in grouped
+        )
+
+        # Remove empty DataFrames
+        combined_results_1 = [dfs for dfs in results_1 if len(dfs.index) > 0]
+        combined_results_2 = [dfs for dfs in results_2 if len(dfs.index) > 0]
+        combined_results_3 = [dfs for dfs in results_3 if len(dfs.index) > 0]
+
+        # Concatenate horizontally
+        if combined_results_1 and combined_results_2 and combined_results_3:
+            df_1 = dd.concat(combined_results_1, axis=1, join="outer", interleave_partitions=True)
+            df_2 = dd.concat(combined_results_2, axis=1, join="outer", interleave_partitions=True)
+            df_3 = dd.concat(combined_results_3, axis=1, join="outer", interleave_partitions=True)
+
+            # Sum overlapping columns
+            total_costs_ddf = df_1.add(df_2, fill_value=0).add(df_3, fill_value=0)
+        else:
+            total_costs_ddf = None
+
+        if variable == "Preis [€/MWh]":
+            # Compute Arbeit [MWh]
+            results_arbeit = Parallel(n_jobs=n_jobs)(
+                delayed(apply_aggregation)(group_df, "Leistung [MW]", group_keys, date_df)
                 for group_keys, group_df in grouped
             )
 
-    logging.info("Aggregations were carried out correctly")
+            combined_results_arbeit = [dfs for dfs in results_arbeit if len(dfs.index) > 0]
 
-    # Filter out empty dask.Dataframes and concatenate the results
-    combined_results = [dfs for dfs in results if not len(dfs.index) == 0]
+            if combined_results_arbeit:
+                arbeit_ddf = dd.concat(combined_results_arbeit, axis=1, join="outer", interleave_partitions=True)
 
-    if combined_results:
-        # Concatenate date_df with the combined_results DataFrame
-        final_ddf = dd.concat(combined_results, axis=1, join='outer', interleave_partitions=True)
+                # Prevent division by zero
+                preis_ddf = total_costs_ddf.div(
+                    arbeit_ddf.replace(0, np.nan))  # Replace 0 with NaN to avoid division error
+                preis_ddf = preis_ddf.fillna(0)  # Replace NaN results back to 0
+                final_ddf = preis_ddf
 
+            else:
+                final_ddf = None
+
+        else:
+            final_ddf = total_costs_ddf
+
+    else:
+        results = Parallel(n_jobs=n_jobs)(
+            delayed(apply_aggregation)(group_df, variable, group_keys, date_df)
+            for group_keys, group_df in grouped
+        )
+
+        combined_results = [dfs for dfs in results if len(dfs.index) > 0]
+
+        if combined_results:
+            final_ddf = dd.concat(combined_results, axis=1, join="outer", interleave_partitions=True)
+        else:
+            final_ddf = None
+
+    if final_ddf is not None:
         logging.info("Data files were appended correctly")
+
+        # Create a new column name based on groupby_list
+        new_column_name = "|".join(groupby_list)
+
+        # Reset the index if timestamps is the index
+        final_ddf = final_ddf.reset_index()
+
+        # Rename the 'timestamps' column (now it is a regular column after reset)
+        final_ddf = final_ddf.rename(columns={"timestamp": new_column_name})
 
         # Calculate min and max dates
         min_date = start_date.strftime("%d%m%Y")
         max_date = end_date.strftime('%d%m%Y')
 
-        # Create csv file_name
+        # Create CSV filename
         variable_name = variable.split(" [")[0]
         time_series_filename = f'aggregated_timeseries_combined_{variable_name}_{min_date}_{max_date}.csv'
 
-        # Create csv file
+        # Save to CSV
         dd.to_csv(df=final_ddf, filename=time_series_filename,
                   single_file=True,
                   encoding='ANSI',
-                  index=True,
+                  index=False,
                   sep=";",
                   decimal=",")
 
-        logging.info(f"Timeseries csv file has been created for {variable_name} \n Check current working directory {os.getcwd()}")
+        logging.info(
+            f"Timeseries csv file has been created for {variable_name}. \n Check the working directory {os.getcwd()}")
 
         return final_ddf
+
+
 
     else:
         logging.info("combined_results was empty")
@@ -421,77 +506,102 @@ def aggregate_all_combinations(kw_leistung_df: dd, variable: str, n_jobs: int = 
 def main():
     st.title("Weiterverrechnungsdateien")
 
-    # Sidebar header
-    st.sidebar.header("Select parameters")
+    # Tabs for switching between functionalities
+    tab1, tab2, tab3 = st.tabs(["Consolidate TSO billing files", "Create timeseries", "Filter timeseries"])
 
-    # Radio button to ask if a consolidated file already exists
-    file_exists = st.sidebar.radio("Does a consolidated file already exist?", ("Nein", "Ja"))
+    with tab1:
+        st.header("Consolidate TSO billing files")
+        ordner = st.text_input('Enter the folder path containing the WVD of the 4ÜNB:',
+                               r"C:\Users\{KID}\Downloads\{Beispiel_Ordner}")
 
-    if file_exists == "Nein":
-        ordner = st.sidebar.text_input('Enter the folder path containing the WVD of the 4ÜNB:',
-                                       r"C:\Users\{KID}\Downloads\{Beispiel_Ordner}")
+        if st.button("Consolidate Files"):
+            if ordner:
+                logging.info("Creating consolidated file")
+                st.write(f"{datetime.now()} ----- Creating consolidated file (see console for log information):")
+                consolidated_WVD = join_weiterverrechnungen(ordner)
 
-    elif file_exists == "Ja":
-        existing_file_path = st.sidebar.file_uploader("Enter the path to the existing consolidated file:", "csv")
+                st.session_state["consolidated_WVD"] = consolidated_WVD
 
-    variable_list = st.sidebar.multiselect(
-        'Select the variables of interest for creating timeseries files',
-        ["Arbeit [MWh]", "Variable Erzeugungsauslagen [€/Viertelstunde]", "Arbeitsabhängige Sonstige Kosten [€/Viertelstunde]",
-         "Anteiliger Werteverbrauch [€/Viertelstunde]", "Entgangene Erlöse Intraday [€/Viertelstunde]",
-         "RD 2.0 Ausfallleistung [MW]", "RD 2.0 Entschädigung Entgangene Einnahmen EEG und KWK [€/Viertelstunde]",
-         "RD 2.0 Zusätzliche Aufwendungen [€/Viertelstunde]", "RD 2.0 Ersparte Aufwendungen [€/Viertelstunde]",
-         "RD 2.0 Abweichung zwischen dem bilanziellen Ausgleich und der Ausfallarbeit [€/Viertelstunde]",
-         "Abweichungen zu dem vom anfNB als BK-Fahrplan gelieferten energetischen Ausgleich im Clusterfall [€/Viertelstunde]",
-        "RD 2.0 Entschädigung Energetischer Ausgleich [€/Viertelstunde]"]
-    )
+    with tab2:
+        st.header("Create Timeseries from Consolidated File")
+        existing_file_path = st.file_uploader("Upload the consolidated file:", type=["csv"])
 
+        # Define available options
+        available_options = ['Zuständiger RAS-ÜNB', 'Aktivierungsobjekt', 'AO-Code', 'AO-Art', 'TM-Richtung',
+                             'Auslösender Prozess', 'Anforderer', 'TM-Art', 'GM-Art']
 
-    if st.sidebar.button('Process Data'):
-        if file_exists == "Ja" and existing_file_path:
-            logging.info("Loading existing consolidated file")
-            st.write(
-                f"{datetime.now()} ----- Loading existing consolidated file (see console for log information):")
+        # Default selected options
+        default_selection = ['Zuständiger RAS-ÜNB', 'Aktivierungsobjekt', 'AO-Code', 'AO-Art', 'TM-Richtung']
 
-            consolidated_WVD = pd.read_csv(existing_file_path,
-                                           sep=";",
-                                           encoding='ANSI',
-                                           decimal=",",
-                                           header=0,
-                                           low_memory=False,
-                                           thousands=".")
+        # Streamlit multiselect widget
+        groupby_list = st.multiselect(
+            'Select group variables for creating timeseries',
+            options=available_options,
+            default=default_selection
+        )
 
-            logging.info("Existing consolidated file has been loaded")
-            st.dataframe(consolidated_WVD.head(15))
+        variable_list = st.multiselect(
+            'Select variables for creating timeseries files',
+            ["Arbeit [MWh]", "Preis [€/MWh]", "Gesamtkosten [€/Viertelstunde]",
+             "Variable Erzeugungsauslagen [€/Viertelstunde]",
+             "Arbeitsabhängige Sonstige Kosten [€/Viertelstunde]",
+             "Anteiliger Werteverbrauch [€/Viertelstunde]", "Entgangene Erlöse Intraday [€/Viertelstunde]",
+             "RD 2.0 Ausfallleistung [MW]", "RD 2.0 Entschädigung Entgangene Einnahmen EEG und KWK [€/Viertelstunde]",
+             "RD 2.0 Zusätzliche Aufwendungen [€/Viertelstunde]", "RD 2.0 Ersparte Aufwendungen [€/Viertelstunde]",
+             "RD 2.0 Abweichung zwischen dem bilanziellen Ausgleich und der Ausfallarbeit [€/Viertelstunde]",
+             "Abweichungen zu dem vom anfNB als BK-Fahrplan gelieferten energetischen Ausgleich im Clusterfall [€/Viertelstunde]",
+             "RD 2.0 Entschädigung Energetischer Ausgleich [€/Viertelstunde]"]
+        )
 
-        elif file_exists == "Nein" and ordner:
-            logging.info("Creating consolidated file")
-            st.write(f"{datetime.now()} ----- Creating consolidated file (see console for log information):")
-            consolidated_WVD = join_weiterverrechnungen(ordner)
+        if st.button("Process Timeseries"):
+            if existing_file_path:
+                logging.info("Loading existing consolidated file")
+                st.write(
+                    f"{datetime.now()} ----- Loading existing consolidated file (see console for log information):")
 
-            logging.info("Consolidated file has been created")
-            st.write(f"{datetime.now()} ----- Consolidated file has been created. Ablagepfad: \n {os.getcwd()}")
-            #st.dataframe(consolidated_WVD.compute().head(16))
+                dateparse = lambda x: datetime.strptime(x, "%d.%m.%Y")
+                consolidated_WVD = pd.read_csv(existing_file_path, sep=";", encoding='ANSI', decimal=",", header=0,
+                                               low_memory=False, thousands=".", parse_dates=["TM von", "TM bis"],
+                                               date_parser=dateparse)
+                logging.info("Existing consolidated file has been loaded")
+                st.dataframe(consolidated_WVD.head(15))
 
-        # Process time series if a variable is selected
-        if variable_list:
-            logging.info(f"Creating timeseries file for the variable(s) chosen")
-            st.write(
-                f"{datetime.now()} ----- Creating timeseries file for the variable(s) chosen (see console for log information)")
+            elif "consolidated_WVD" in st.session_state:
+                consolidated_WVD = st.session_state["consolidated_WVD"]
 
-            if type(consolidated_WVD) != pd.DataFrame:
-                consolidated_WVD = consolidated_WVD.compute()
-                logging.info(
-                    f"Consolidated file has been transformed from dask.dataframe to {type(consolidated_WVD)}")
-            try:
-                Parallel(n_jobs=-1)(
-                    delayed(aggregate_all_combinations)(consolidated_WVD, variable) for variable in variable_list
-                )
-            except ValueError as ve:
-                st.write(f"{datetime.now()} ----- Please check log information. Exception has been raised: {ve}")
+            else:
+                st.write("No consolidated file available. Please upload or consolidate first.")
+                return
 
-            logging.info("Timeseries files were successfully created!")
-            st.write(f"{datetime.now()} ----- Timeseries file has been created. Ablagepfad: \n {os.getcwd()}")
+            if variable_list and groupby_list:
+                logging.info("Creating timeseries file for selected variables")
+                st.write(
+                    f"{datetime.now()} ----- Creating timeseries file for selected variables (see console for log information)")
+
+                try:
+                    Parallel(n_jobs=-1)(
+                        delayed(aggregate_all_combinations)(consolidated_WVD, variable, groupby_list) for variable in variable_list
+                    )
+
+                except ValueError as ve:
+                    st.write(f"{datetime.now()} ----- Exception occurred: {ve}")
+
+                st.write(f"{datetime.now()} ----- Timeseries file has been created. Ablagepfad: \n {os.getcwd()}")
+                logging.info("Timeseries files successfully created!")
+
+    with tab3:
+        st.header("Filter timeseries files")
+
+        timeseries_file_path = st.file_uploader("Upload the timeseries file:", type=["csv"])
+
+        st.text("Filters tbd")
+        st.text("Example AO-Code = 12WDENDK-COUNTR-")
+
 
 
 if __name__ == "__main__":
     main()
+
+
+
+
