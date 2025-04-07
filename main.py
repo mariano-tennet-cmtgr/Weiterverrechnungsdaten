@@ -23,7 +23,6 @@ logging.basicConfig(
     handlers=[logging.StreamHandler()]
 )
 
-
 def prepare_data_for_variable(csv_path: str) -> dd:
     logging.info(f"Data is being prepared for this file: {os.path.basename(csv_path)}")
     # Import masterdata as csv
@@ -528,7 +527,7 @@ def main():
 
         # Define available options
         available_options = ['Zuständiger RAS-ÜNB', 'Aktivierungsobjekt', 'AO-Code', 'AO-Art', 'TM-Richtung',
-                             'Auslösender Prozess', 'Anforderer', 'TM-Art', 'GM-Art']
+                             'Auslösender Prozess', 'Anforderer', 'TM-Art', 'GM-Art', 'Anschlussregelzone des AO']
 
         # Default selected options
         default_selection = ['Zuständiger RAS-ÜNB', 'Aktivierungsobjekt', 'AO-Code', 'AO-Art', 'TM-Richtung']
@@ -594,9 +593,7 @@ def main():
 
         timeseries_file_path = st.file_uploader("Upload the timeseries file:", type=["csv"])
 
-        st.text("Filters tbd")
-        st.text("Example AO-Code = 12WDENDK-COUNTR-")
-
+        st.write("tbd")
 
 
 if __name__ == "__main__":
